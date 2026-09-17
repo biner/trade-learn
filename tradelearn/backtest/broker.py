@@ -783,6 +783,12 @@ class RustBroker:
         price: float | None,
     ) -> None:
         order.status = Order.Submitted
+        # 回填订单创建时刻的 bar 时间戳（用于回测落库映射「委托日期」，未成交取消单同样可得）
+        if getattr(order, "created_ts", None) is None:
+            try:
+                order.created_ts = self._fill_datetime(order.data)
+            except Exception:
+                pass
         self._orders.append(order)
         self._orders_by_ref[order.ref] = order
         if order.oco is not None:
