@@ -198,6 +198,12 @@ impl BacktestEngine {
                 remaining.push(order);
                 continue;
             }
+            // 订单有效期检查：若当前 Bar 时间已超过订单失效截止时间，自动过期剔除
+            if let Some(valid_until) = order.valid_until {
+                if bar.ts > valid_until {
+                    continue;
+                }
+            }
             // 跟踪止损单：先用「上一根 bar 的水位」参与撮合判定，
             // 避免同一根 bar 先拿 high 抬水位、再用自己的 low 触发（bar 内前视）。
             let matched = match_order(&order, bar, options);
@@ -255,10 +261,18 @@ impl BacktestEngine {
     ) -> Vec<FillRecord> {
         let mut fills = Vec::new();
         let mut candidates = Vec::new();
+        let mut filled = HashSet::new();
+        let mut canceled = HashSet::new();
 
         for (idx, order) in current_pending.iter().enumerate() {
             if order.symbol != bar.symbol {
                 continue;
+            }
+            if let Some(valid_until) = order.valid_until {
+                if bar.ts > valid_until {
+                    canceled.insert(idx);
+                    continue;
+                }
             }
             if let Some((rank, raw_price)) = smart_match_price(order, bar, options) {
                 let fill_event = fill_from_raw_price(order, raw_price, bar, options);
@@ -272,8 +286,6 @@ impl BacktestEngine {
                 .then(a.2.cmp(&b.2))
         });
 
-        let mut filled = HashSet::new();
-        let mut canceled = HashSet::new();
         for (_, _, idx, fill_event) in candidates {
             if filled.contains(&idx) || canceled.contains(&idx) {
                 continue;
@@ -458,6 +470,7 @@ impl BacktestEngine {
         stop_price: Option<f64>,
         trail_amount: Option<f64>,
         trail_percent: Option<f64>,
+        valid_until: Option<Timestamp>,
     ) -> OrderId {
         let order_id = self.next_order_id;
         self.next_order_id += 1;
@@ -473,6 +486,7 @@ impl BacktestEngine {
             trail_amount,
             trail_percent,
             trail_watermark: None,
+            valid_until,
         });
         order_id
     }

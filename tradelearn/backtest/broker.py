@@ -98,6 +98,8 @@ class RustBroker:
         # valid 到期时间缓存：按 order.ref 记录「创建时刻 + valid」算出的绝对失效时间，
         # 避免每 bar 用当前时间重算导致 deadline 永远后移。
         self._valid_deadline_by_ref: dict[int, Any] = {}
+        # 缓冲旁路：按 order.ref 携带 valid_until UNIX 秒级时间戳供 Rust 内核纳秒级判断
+        self._valid_until_by_ref: dict[int, int | None] = {}
         self._cancel_buffer: list[int] = []
         self._proxy_events: list[Any] = []
         self._trade_on_close = False
@@ -562,6 +564,10 @@ class RustBroker:
         """
         return self._trail_params_by_ref.pop(provisional_ref, (None, None))
 
+    def pop_valid_until(self, provisional_ref: int) -> int | None:
+        """取出并移除某个（临时）订单 ref 的 valid_until UNIX 秒级时间戳。"""
+        return self._valid_until_by_ref.pop(provisional_ref, None)
+
     def bind_rust_order_ref(self, provisional_ref: int, rust_ref: int) -> None:
         """Replace a provisional Python order ref with the Rust-assigned ref."""
         order = self._orders_by_ref.pop(provisional_ref)
@@ -609,11 +615,11 @@ class RustBroker:
         stop_price: float | None,
         trail_amount: float | None = None,
         trail_percent: float | None = None,
+        valid_until: int | None = None,
     ) -> int:
         submit_for_symbol = getattr(self._engine, "submit_order_for_symbol", None)
         if callable(submit_for_symbol):
-            if trail_amount is None and trail_percent is None:
-                # 无跟踪参数时保持历史 6 参签名，避免第三方/测试 FakeEngine 破契约
+            if trail_amount is None and trail_percent is None and valid_until is None:
                 return submit_for_symbol(
                     symbol, side_str, ot_str, actual_size, limit_price, stop_price
                 )
@@ -626,8 +632,9 @@ class RustBroker:
                 stop_price,
                 trail_amount,
                 trail_percent,
+                valid_until,
             )
-        if trail_amount is None and trail_percent is None:
+        if trail_amount is None and trail_percent is None and valid_until is None:
             return self._engine.submit_order(
                 side_str, ot_str, actual_size, limit_price, stop_price
             )
@@ -639,6 +646,7 @@ class RustBroker:
             stop_price,
             trail_amount,
             trail_percent,
+            valid_until,
         )
 
     def _submit_to_rust_engine(
@@ -652,6 +660,7 @@ class RustBroker:
         stop_price: float | None,
         trail_amount: float | None = None,
         trail_percent: float | None = None,
+        valid_until: int | None = None,
     ) -> None:
         order_id = self._submit_payload_to_engine(
             symbol,
@@ -662,6 +671,7 @@ class RustBroker:
             stop_price,
             trail_amount,
             trail_percent,
+            valid_until,
         )
         self.bind_rust_order_ref(order.ref, order_id)
 
@@ -806,6 +816,15 @@ class RustBroker:
         self._route_accepted_order_to_matcher(order, is_buy, actual_size, price)
         self._notify_order_event(owner, order)
 
+    def _valid_until_ts(self, order: Order) -> int | None:
+        deadline = self._order_valid_deadline(order)
+        if deadline is not None:
+            if isinstance(deadline, (int, float)):
+                return int(deadline)
+            if hasattr(deadline, "timestamp"):
+                return int(deadline.timestamp())
+        return None
+
     def _route_accepted_order_to_matcher(
         self,
         order: Order,
@@ -816,13 +835,14 @@ class RustBroker:
         if self._engine is not None:
             side_str = "buy" if is_buy else "sell"
             payload = self._rust_order_payload(order, side_str, actual_size, price)
+            valid_until = self._valid_until_ts(order)
             if self._buffer_order_submissions:
-                # 缓冲契约保持 7 元组不变；trail 参数经 _trail_params_by_ref 旁路携带
                 self._trail_params_by_ref[order.ref] = self._trail_params(order)
+                self._valid_until_by_ref[order.ref] = valid_until
                 self._order_submit_buffer.append((order.ref, *payload))
             else:
                 trail_amount, trail_percent = self._trail_params(order)
-                self._submit_to_rust_engine(order, *payload, trail_amount, trail_percent)
+                self._submit_to_rust_engine(order, *payload, trail_amount, trail_percent, valid_until)
             order.status = Order.Accepted
         else:
             order.status = Order.Accepted
@@ -867,10 +887,12 @@ class RustBroker:
     def _order_created_datetime(self, order: Order) -> Any:
         """订单创建时刻（相对 valid 的基准时间）。
 
-        优先用 Order 的 created 时间戳（若存在），否则退回当前 bar 时间。
+        优先用 Order 的 created 时间戳或 created_ts，否则退回当前 bar 时间。
         """
         created = getattr(order, "created", None)
         ts = getattr(created, "dt", None) if created is not None else None
+        if ts is None:
+            ts = getattr(order, "created_ts", None)
         if ts is None:
             ts = self._fill_datetime(order.data)
         if isinstance(ts, (int, float)):
@@ -880,6 +902,8 @@ class RustBroker:
                 return None
         if isinstance(ts, datetime.datetime):
             return ts
+        if isinstance(ts, datetime.date):
+            return datetime.datetime(ts.year, ts.month, ts.day, tzinfo=datetime.timezone.utc)
         return None
 
     def _order_valid_deadline(self, order: Order) -> Any:
@@ -912,14 +936,23 @@ class RustBroker:
                 self._valid_deadline_by_ref[order.ref] = deadline
                 return deadline
             if isinstance(valid, datetime.datetime):
+                self._valid_deadline_by_ref[order.ref] = valid
                 return valid
             if isinstance(valid, datetime.date):
-                return datetime.datetime(valid.year, valid.month, valid.day,
-                                         tzinfo=getattr(base, "tzinfo", None))
+                deadline = datetime.datetime(
+                    valid.year,
+                    valid.month,
+                    valid.day,
+                    tzinfo=getattr(base, "tzinfo", datetime.timezone.utc),
+                )
+                self._valid_deadline_by_ref[order.ref] = deadline
+                return deadline
             if isinstance(valid, (int, float)):
                 if base is None:
                     return None
-                return base + datetime.timedelta(seconds=float(valid))
+                deadline = base + datetime.timedelta(seconds=float(valid))
+                self._valid_deadline_by_ref[order.ref] = deadline
+                return deadline
         except Exception:
             return None
         return None
@@ -934,24 +967,27 @@ class RustBroker:
                 return None
         if isinstance(ts, datetime.datetime):
             return ts
+        if isinstance(ts, datetime.date):
+            return datetime.datetime(ts.year, ts.month, ts.day, tzinfo=datetime.timezone.utc)
         return None
 
-    def _expire_valid_orders(self, i: int, owner: Strategy | None = None) -> None:
-        """按 order.valid 到期撤销存活挂单（每 bar 撮合后调用）。
+    def pre_step(self, i: int, owner: Strategy | None = None) -> None:
+        """在每 bar 撮合前调用，执行 valid 到期撤单。"""
+        self._curr_idx = i
+        self._expire_valid_orders(i, owner=owner)
 
-        底层此前只存储 valid 字段但从不消费；这里补齐到期语义：
+    def _expire_valid_orders(self, i: int, owner: Strategy | None = None) -> None:
+        """按 order.valid 到期撤销存活挂单（在每 bar 撮合前调用）。
+
         存活订单（Submitted/Accepted/Partial）超过 valid 失效时间即置为 Expired，
         并从 Rust 侧撤单（经 _cancel_buffer 由 bar loop 消化）。
         """
-        deadline_cache: dict[int, Any] = {}
+        self._curr_idx = i
         now_cache: dict[int, Any] = {}
-        for order in self._orders:
+        for order in list(self._orders):
             if order.status not in (Order.Submitted, Order.Accepted, Order.Partial):
                 continue
-            deadline = deadline_cache.get(id(order.data), _MISSING)
-            if deadline is _MISSING:
-                deadline = self._order_valid_deadline(order)
-                deadline_cache[id(order.data)] = deadline
+            deadline = self._order_valid_deadline(order)
             if deadline is None:
                 continue
             now = now_cache.get(id(order.data), _MISSING)

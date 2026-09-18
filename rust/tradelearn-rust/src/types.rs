@@ -72,6 +72,8 @@ pub struct OrderEvent {
     pub trail_percent: Option<f64>,
     /// 跟踪止损的当前水位（持仓期间最优价），跨 bar 持久化。
     pub trail_watermark: Option<f64>,
+    /// 订单绝对失效时间戳（UNIX秒）。若当前 bar.ts > valid_until，则自动过期不撮合。
+    pub valid_until: Option<Timestamp>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

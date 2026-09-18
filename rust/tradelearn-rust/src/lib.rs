@@ -88,6 +88,7 @@ fn match_order_fill(
         trail_amount: None,
         trail_percent: None,
         trail_watermark: None,
+        valid_until: None,
     };
     let bar = BarEvent {
         ts,
@@ -315,9 +316,12 @@ impl RustBacktestEngine {
             {
                 let side = parse_order_side(&side)?;
                 let order_type = parse_order_type(&order_type)?;
-                // trail 参数经 broker.pop_trail_params(ref) 旁路取出（缓冲契约保持 7 元组）。
+                // trail 与 valid_until 参数经 broker 旁路取出（缓冲契约保持 7 元组）。
                 let (trail_amount, trail_percent): (Option<f64>, Option<f64>) = broker
                     .call_method1(py, "pop_trail_params", (provisional_ref,))?
+                    .extract(py)?;
+                let valid_until: Option<i64> = broker
+                    .call_method1(py, "pop_valid_until", (provisional_ref,))?
                     .extract(py)?;
                 let order_id = self.inner.submit_order(
                     symbol,
@@ -328,6 +332,7 @@ impl RustBacktestEngine {
                     stop_price,
                     trail_amount,
                     trail_percent,
+                    valid_until,
                 );
                 bindings.push((provisional_ref, order_id));
             }
@@ -338,7 +343,7 @@ impl RustBacktestEngine {
         Ok(())
     }
 
-    #[pyo3(signature = (symbol, side, order_type, size, limit_price=None, stop_price=None, trail_amount=None, trail_percent=None))]
+    #[pyo3(signature = (symbol, side, order_type, size, limit_price=None, stop_price=None, trail_amount=None, trail_percent=None, valid_until=None))]
     fn submit_order_for_symbol(
         &mut self,
         symbol: String,
@@ -349,6 +354,7 @@ impl RustBacktestEngine {
         stop_price: Option<f64>,
         trail_amount: Option<f64>,
         trail_percent: Option<f64>,
+        valid_until: Option<i64>,
     ) -> PyResult<u64> {
         let side = parse_order_side(side)?;
         let order_type = parse_order_type(order_type)?;
@@ -361,10 +367,11 @@ impl RustBacktestEngine {
             stop_price,
             trail_amount,
             trail_percent,
+            valid_until,
         ))
     }
 
-    #[pyo3(signature = (side, order_type, size, limit_price=None, stop_price=None, trail_amount=None, trail_percent=None))]
+    #[pyo3(signature = (side, order_type, size, limit_price=None, stop_price=None, trail_amount=None, trail_percent=None, valid_until=None))]
     fn submit_order(
         &mut self,
         side: &str,
@@ -374,6 +381,7 @@ impl RustBacktestEngine {
         stop_price: Option<f64>,
         trail_amount: Option<f64>,
         trail_percent: Option<f64>,
+        valid_until: Option<i64>,
     ) -> PyResult<u64> {
         self.submit_order_for_symbol(
             "data0".to_string(),
@@ -384,6 +392,7 @@ impl RustBacktestEngine {
             stop_price,
             trail_amount,
             trail_percent,
+            valid_until,
         )
     }
 

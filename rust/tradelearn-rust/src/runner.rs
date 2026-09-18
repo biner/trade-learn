@@ -217,6 +217,12 @@ impl RustBarRunner {
             {
                 let side = parse_order_side(&side)?;
                 let order_type = parse_order_type(&order_type)?;
+                let (trail_amount, trail_percent): (Option<f64>, Option<f64>) = broker
+                    .call_method1(py, "pop_trail_params", (provisional_ref,))?
+                    .extract(py)?;
+                let valid_until: Option<i64> = broker
+                    .call_method1(py, "pop_valid_until", (provisional_ref,))?
+                    .extract(py)?;
                 let order_id = engine.inner.submit_order(
                     symbol,
                     side,
@@ -224,8 +230,9 @@ impl RustBarRunner {
                     order_size,
                     limit_price,
                     stop_price,
-                    None,
-                    None,
+                    trail_amount,
+                    trail_percent,
+                    valid_until,
                 );
                 bindings.push((provisional_ref, order_id));
             }
@@ -350,6 +357,12 @@ impl RustClockedMultiDataRunner {
             {
                 let side = parse_order_side(&side)?;
                 let order_type = parse_order_type(&order_type)?;
+                let (trail_amount, trail_percent): (Option<f64>, Option<f64>) = broker
+                    .call_method1(py, "pop_trail_params", (provisional_ref,))?
+                    .extract(py)?;
+                let valid_until: Option<i64> = broker
+                    .call_method1(py, "pop_valid_until", (provisional_ref,))?
+                    .extract(py)?;
                 let order_id = engine_ref.inner.submit_order(
                     symbol,
                     side,
@@ -357,8 +370,9 @@ impl RustClockedMultiDataRunner {
                     order_size,
                     limit_price,
                     stop_price,
-                    None,
-                    None,
+                    trail_amount,
+                    trail_percent,
+                    valid_until,
                 );
                 bindings.push((provisional_ref, order_id));
             }
