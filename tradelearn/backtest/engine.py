@@ -81,6 +81,8 @@ def _orders_frame(broker: Any) -> pd.DataFrame:
         created_ts = getattr(order, "created_ts", None)
         if created_ts is None and data is not None:
             created_ts = broker._fill_datetime(data)
+        parent_ref = getattr(getattr(order, "parent", None), "ref", None)
+        oco_ref = getattr(getattr(order, "oco", None), "ref", None)
         rows.append(
             {
                 "ref": order.ref,
@@ -89,9 +91,15 @@ def _orders_frame(broker: Any) -> pd.DataFrame:
                 "side": "buy" if order.isbuy() else "sell",
                 "exectype": order.exectype,
                 "status": order.getstatusname(),
+                "price": order.price,
+                "pricelimit": getattr(order, "pricelimit", None),
+                "parent_ref": parent_ref,
+                "oco_ref": oco_ref,
                 "size": order.size,
                 "executed_size": order.executed.size,
                 "executed_price": order.executed.price,
+                "executed_dt": getattr(order.executed, "dt", None),
+                "info": getattr(order, "info", {}) or {},
             }
         )
     frame = pd.DataFrame(rows)

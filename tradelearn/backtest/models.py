@@ -259,6 +259,7 @@ class ExecutedInfo:
     comm: float = 0.0
     slippage: float = 0.0
     pnl: float = 0.0
+    dt: Any = None
 
 
 @dataclass

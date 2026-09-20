@@ -40,6 +40,11 @@ fn order(order_type: OrderType, side: OrderSide) -> OrderEvent {
         limit_price: None,
         stop_price: None,
         created_ts: 1,
+        trail_amount: None,
+        trail_percent: None,
+        trail_watermark: None,
+        valid_until: None,
+        oco_id: None,
     }
 }
 

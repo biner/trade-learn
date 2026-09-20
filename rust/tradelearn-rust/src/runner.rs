@@ -3,7 +3,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 use crate::types::*;
-use crate::{parse_order_side, parse_order_type, RustBacktestEngine};
+use crate::{parse_order_side, parse_order_type, pop_broker_aux_params, RustBacktestEngine};
 
 impl MultiDataFeed {
     pub fn new() -> Self {
@@ -205,6 +205,18 @@ impl RustBarRunner {
             let (size, price) = engine.inner.get_position();
             let data_cursors = self.cursors[cursor].clone();
             let drained = on_bar.call1(py, (cursor, data_cursors, fills, cash, size, price))?;
+
+            // 撤单同步：strategy.next() 期间发起的 cancel() 统一由 broker._cancel_buffer 倾倒下发，
+            // 必须在 continue 之前同步撤单（即便当前 bar 无新下挂单）。
+            if broker.bind(py).hasattr("drain_cancel_buffer")? {
+                let cancels: Vec<u64> = broker
+                    .call_method0(py, "drain_cancel_buffer")?
+                    .extract(py)?;
+                for cancel_ref in cancels {
+                    engine.inner.remove_order(cancel_ref);
+                }
+            }
+
             if drained.is_none(py) {
                 continue;
             }
@@ -217,12 +229,8 @@ impl RustBarRunner {
             {
                 let side = parse_order_side(&side)?;
                 let order_type = parse_order_type(&order_type)?;
-                let (trail_amount, trail_percent): (Option<f64>, Option<f64>) = broker
-                    .call_method1(py, "pop_trail_params", (provisional_ref,))?
-                    .extract(py)?;
-                let valid_until: Option<i64> = broker
-                    .call_method1(py, "pop_valid_until", (provisional_ref,))?
-                    .extract(py)?;
+                let (trail_amount, trail_percent, valid_until, oco_ref) =
+                    pop_broker_aux_params(&broker.bind(py), provisional_ref)?;
                 let order_id = engine.inner.submit_order(
                     symbol,
                     side,
@@ -233,6 +241,7 @@ impl RustBarRunner {
                     trail_amount,
                     trail_percent,
                     valid_until,
+                    oco_ref,
                 );
                 bindings.push((provisional_ref, order_id));
             }
@@ -344,6 +353,21 @@ impl RustClockedMultiDataRunner {
             };
             let data_cursors = self.cursors[cursor].clone();
             let drained = on_bar.call1(py, (cursor, data_cursors, fills, cash, size, price))?;
+
+            // 撤单同步：strategy.next() 期间发起的 cancel() 统一由 broker._cancel_buffer 倾倒下发，
+            // 必须在 continue 之前同步撤单（即便当前 bar 无新下挂单）。
+            if broker.bind(py).hasattr("drain_cancel_buffer")? {
+                let cancels: Vec<u64> = broker
+                    .call_method0(py, "drain_cancel_buffer")?
+                    .extract(py)?;
+                if !cancels.is_empty() {
+                    let mut engine_ref = engine.borrow_mut(py);
+                    for cancel_ref in cancels {
+                        engine_ref.inner.remove_order(cancel_ref);
+                    }
+                }
+            }
+
             if drained.is_none(py) {
                 continue;
             }
@@ -357,12 +381,8 @@ impl RustClockedMultiDataRunner {
             {
                 let side = parse_order_side(&side)?;
                 let order_type = parse_order_type(&order_type)?;
-                let (trail_amount, trail_percent): (Option<f64>, Option<f64>) = broker
-                    .call_method1(py, "pop_trail_params", (provisional_ref,))?
-                    .extract(py)?;
-                let valid_until: Option<i64> = broker
-                    .call_method1(py, "pop_valid_until", (provisional_ref,))?
-                    .extract(py)?;
+                let (trail_amount, trail_percent, valid_until, oco_ref) =
+                    pop_broker_aux_params(&broker.bind(py), provisional_ref)?;
                 let order_id = engine_ref.inner.submit_order(
                     symbol,
                     side,
@@ -373,6 +393,7 @@ impl RustClockedMultiDataRunner {
                     trail_amount,
                     trail_percent,
                     valid_until,
+                    oco_ref,
                 );
                 bindings.push((provisional_ref, order_id));
             }

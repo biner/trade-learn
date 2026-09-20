@@ -1,5 +1,26 @@
 use std::collections::{HashMap, HashSet};
 
+/// 判断两个订单是否属于同一个 OCO 互斥组（支持成对引用与共享同根 Leader）。
+fn is_oco_sibling(
+    a_id: OrderId,
+    a_oco: Option<OrderId>,
+    b_id: OrderId,
+    b_oco: Option<OrderId>,
+) -> bool {
+    if a_id == b_id {
+        return false;
+    }
+    if a_oco == Some(b_id) || b_oco == Some(a_id) {
+        return true;
+    }
+    if let (Some(a_ref), Some(b_ref)) = (a_oco, b_oco) {
+        if a_ref == b_ref {
+            return true;
+        }
+    }
+    false
+}
+
 use crate::matching::{
     fill_from_raw_price, is_exit_fill, is_exit_order_for_position, match_order, match_order_smart,
     smart_match_price, smart_order_priority, trailing_watermark,
@@ -186,27 +207,32 @@ impl BacktestEngine {
         options: &ExecutionOptions,
     ) -> Vec<FillRecord> {
         let mut fills = Vec::new();
-        let mut remaining = Vec::new();
         let current_pending = std::mem::take(&mut self.pending);
 
         if options.smart_matching {
             return self.match_all_pending_smart(bar, options, current_pending);
         }
 
-        for order in current_pending {
+        let mut filled = HashSet::new();
+        let mut canceled = HashSet::new();
+
+        for (idx, order) in current_pending.iter().enumerate() {
+            if filled.contains(&idx) || canceled.contains(&idx) {
+                continue;
+            }
             if order.symbol != bar.symbol {
-                remaining.push(order);
                 continue;
             }
             // 订单有效期检查：若当前 Bar 时间已超过订单失效截止时间，自动过期剔除
             if let Some(valid_until) = order.valid_until {
                 if bar.ts > valid_until {
+                    canceled.insert(idx);
                     continue;
                 }
             }
             // 跟踪止损单：先用「上一根 bar 的水位」参与撮合判定，
             // 避免同一根 bar 先拿 high 抬水位、再用自己的 low 触发（bar 内前视）。
-            let matched = match_order(&order, bar, options);
+            let matched = match_order(order, bar, options);
             if let Some(fill_event) = matched {
                 if !self.can_apply_fill(&fill_event, options.mult) {
                     continue;
@@ -236,20 +262,38 @@ impl BacktestEngine {
                 };
                 self.results.fills.push(record.clone());
                 fills.push(record);
-            } else {
-                // 未成交的跟踪单：用当前 bar 极值推进水位后回写，供下一根 bar 使用。
-                let mut carried = order;
-                if matches!(
-                    carried.order_type,
-                    OrderType::StopTrail | OrderType::StopTrailLimit
-                ) {
-                    carried.trail_watermark =
-                        Some(trailing_watermark(carried.side, bar, carried.trail_watermark));
+                filled.insert(idx);
+
+                // 【原版 _ococheck 机制】：该单成交后，其所在 OCO 组的其余兄弟订单立即作废
+                for (other_idx, other) in current_pending.iter().enumerate() {
+                    if other_idx != idx
+                        && !filled.contains(&other_idx)
+                        && is_oco_sibling(order.order_id, order.oco_id, other.order_id, other.oco_id)
+                    {
+                        canceled.insert(other_idx);
+                    }
                 }
-                remaining.push(carried);
             }
         }
-        self.pending = remaining;
+
+        self.pending = current_pending
+            .into_iter()
+            .enumerate()
+            .filter_map(|(idx, mut order)| {
+                if filled.contains(&idx) || canceled.contains(&idx) {
+                    None
+                } else {
+                    if matches!(
+                        order.order_type,
+                        OrderType::StopTrail | OrderType::StopTrailLimit
+                    ) {
+                        order.trail_watermark =
+                            Some(trailing_watermark(order.side, bar, order.trail_watermark));
+                    }
+                    Some(order)
+                }
+            })
+            .collect();
         fills
     }
 
@@ -328,6 +372,16 @@ impl BacktestEngine {
             fills.push(record);
             filled.insert(idx);
 
+            // 【原版 _ococheck 机制】：该单成交后，其所在 OCO 组的其余兄弟订单立即作废
+            for (other_idx, other) in current_pending.iter().enumerate() {
+                if other_idx != idx
+                    && !filled.contains(&other_idx)
+                    && is_oco_sibling(order.order_id, order.oco_id, other.order_id, other.oco_id)
+                {
+                    canceled.insert(other_idx);
+                }
+            }
+
             if was_exit && new_size.abs() < 1e-9 {
                 for (other_idx, other) in current_pending.iter().enumerate() {
                     if other_idx != idx
@@ -396,22 +450,25 @@ impl BacktestEngine {
         options: &ExecutionOptions,
     ) -> Vec<FillRecord> {
         let mut fills = Vec::new();
-        let mut remaining = Vec::new();
         let bars_by_symbol: HashMap<&str, &BarEvent> =
             bars.iter().map(|bar| (bar.symbol.as_str(), bar)).collect();
         let current_pending = std::mem::take(&mut self.pending);
+        let mut filled = HashSet::new();
+        let mut canceled = HashSet::new();
 
-        for order in current_pending {
+        for (idx, order) in current_pending.iter().enumerate() {
+            if filled.contains(&idx) || canceled.contains(&idx) {
+                continue;
+            }
             let Some(bar) = bars_by_symbol.get(order.symbol.as_str()) else {
-                remaining.push(order);
                 continue;
             };
             // 跟踪止损单：先用「上一根 bar 的水位」参与撮合判定，未成交再推进水位，
             // 避免同一根 bar 用自身极值制造 bar 内前视。
             let matched = if options.smart_matching {
-                match_order_smart(&order, bar, options)
+                match_order_smart(order, bar, options)
             } else {
-                match_order(&order, bar, options)
+                match_order(order, bar, options)
             };
             if let Some(fill_event) = matched {
                 if !self.can_apply_fill(&fill_event, options.mult) {
@@ -442,20 +499,40 @@ impl BacktestEngine {
                 };
                 self.results.fills.push(record.clone());
                 fills.push(record);
-            } else {
-                // 未成交的跟踪单：用当前 bar 极值推进水位后回写，供下一根 bar 使用。
-                let mut carried = order;
-                if matches!(
-                    carried.order_type,
-                    OrderType::StopTrail | OrderType::StopTrailLimit
-                ) {
-                    carried.trail_watermark =
-                        Some(trailing_watermark(carried.side, bar, carried.trail_watermark));
+                filled.insert(idx);
+
+                // 【原版 _ococheck 机制】：该单成交后，其所在 OCO 组的其余兄弟订单立即作废
+                for (other_idx, other) in current_pending.iter().enumerate() {
+                    if other_idx != idx
+                        && !filled.contains(&other_idx)
+                        && is_oco_sibling(order.order_id, order.oco_id, other.order_id, other.oco_id)
+                    {
+                        canceled.insert(other_idx);
+                    }
                 }
-                remaining.push(carried);
             }
         }
-        self.pending = remaining;
+
+        self.pending = current_pending
+            .into_iter()
+            .enumerate()
+            .filter_map(|(idx, mut order)| {
+                if filled.contains(&idx) || canceled.contains(&idx) {
+                    None
+                } else {
+                    if let Some(bar) = bars_by_symbol.get(order.symbol.as_str()) {
+                        if matches!(
+                            order.order_type,
+                            OrderType::StopTrail | OrderType::StopTrailLimit
+                        ) {
+                            order.trail_watermark =
+                                Some(trailing_watermark(order.side, bar, order.trail_watermark));
+                        }
+                    }
+                    Some(order)
+                }
+            })
+            .collect();
         fills
     }
 
@@ -471,6 +548,7 @@ impl BacktestEngine {
         trail_amount: Option<f64>,
         trail_percent: Option<f64>,
         valid_until: Option<Timestamp>,
+        oco_id: Option<OrderId>,
     ) -> OrderId {
         let order_id = self.next_order_id;
         self.next_order_id += 1;
@@ -487,6 +565,7 @@ impl BacktestEngine {
             trail_percent,
             trail_watermark: None,
             valid_until,
+            oco_id,
         });
         order_id
     }

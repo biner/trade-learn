@@ -18,7 +18,7 @@ class BacktestRuntimeConfig:
     cash: float
     commission: float
     commission_model: Any | None = None
-    match_mode: str = "exact"
+    match_mode: str = "smart"
     trade_on_close: bool = False
     exactbars: bool = False
     stdstats: bool = True
@@ -40,7 +40,7 @@ class BacktestRuntimeConfig:
                 or 0.0
             ),
             commission_model=getattr(broker, "_commission_model", None),
-            match_mode=str(getattr(owner, "match_mode", "exact")),
+            match_mode=str(getattr(owner, "match_mode", "smart")),
             trade_on_close=bool(getattr(owner, "trade_on_close", False)),
             exactbars=bool(getattr(owner, "exactbars", False)),
             stdstats=bool(getattr(owner, "stdstats", True)),

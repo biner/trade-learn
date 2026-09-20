@@ -51,6 +51,11 @@ fn order(order_id: u64, ts: i64) -> OrderEvent {
         limit_price: Some(10.5),
         stop_price: None,
         created_ts: ts,
+        trail_amount: None,
+        trail_percent: None,
+        trail_watermark: None,
+        valid_until: None,
+        oco_id: None,
     }
 }
 

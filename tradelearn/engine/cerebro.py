@@ -41,7 +41,7 @@ class Cerebro:
     """Main orchestrator for backtesting (Backtrader facade)."""
     def __init__(
         self,
-        match_mode: str = 'exact',
+        match_mode: str = 'smart',
         callback_batch: int = 1,
         trade_on_close: bool = False,
         exactbars: bool = False,

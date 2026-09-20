@@ -44,6 +44,11 @@ fn market_order(order_id: u64, symbol: &str, side: OrderSide, size: f64) -> Orde
         limit_price: None,
         stop_price: None,
         created_ts: order_id as i64,
+        trail_amount: None,
+        trail_percent: None,
+        trail_watermark: None,
+        valid_until: None,
+        oco_id: None,
     }
 }
 

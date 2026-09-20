@@ -52,7 +52,7 @@ class RustBroker:
         cash: float = 100000.0,
         commission: float = 0.0,
         mult: float = 1.0,
-        match_mode: str = "exact",
+        match_mode: str = "smart",
     ):
         if match_mode not in self._RUST_MATCH_MODES:
             raise ValueError(
@@ -100,6 +100,8 @@ class RustBroker:
         self._valid_deadline_by_ref: dict[int, Any] = {}
         # 缓冲旁路：按 order.ref 携带 valid_until UNIX 秒级时间戳供 Rust 内核纳秒级判断
         self._valid_until_by_ref: dict[int, int | None] = {}
+        # 缓冲旁路：按 order.ref 携带 oco_ref 供 Rust 内核进行纳秒级 _ococheck 互斥
+        self._oco_ref_by_ref: dict[int, int] = {}
         self._cancel_buffer: list[int] = []
         self._proxy_events: list[Any] = []
         self._trade_on_close = False
@@ -568,6 +570,10 @@ class RustBroker:
         """取出并移除某个（临时）订单 ref 的 valid_until UNIX 秒级时间戳。"""
         return self._valid_until_by_ref.pop(provisional_ref, None)
 
+    def pop_oco_ref(self, provisional_ref: int) -> int | None:
+        """取出并移除某个（临时）订单 ref 的 oco_ref 互斥订单 ID。"""
+        return self._oco_ref_by_ref.pop(provisional_ref, None)
+
     def bind_rust_order_ref(self, provisional_ref: int, rust_ref: int) -> None:
         """Replace a provisional Python order ref with the Rust-assigned ref."""
         order = self._orders_by_ref.pop(provisional_ref)
@@ -616,13 +622,10 @@ class RustBroker:
         trail_amount: float | None = None,
         trail_percent: float | None = None,
         valid_until: int | None = None,
+        oco_ref: int | None = None,
     ) -> int:
         submit_for_symbol = getattr(self._engine, "submit_order_for_symbol", None)
         if callable(submit_for_symbol):
-            if trail_amount is None and trail_percent is None and valid_until is None:
-                return submit_for_symbol(
-                    symbol, side_str, ot_str, actual_size, limit_price, stop_price
-                )
             return submit_for_symbol(
                 symbol,
                 side_str,
@@ -633,10 +636,7 @@ class RustBroker:
                 trail_amount,
                 trail_percent,
                 valid_until,
-            )
-        if trail_amount is None and trail_percent is None and valid_until is None:
-            return self._engine.submit_order(
-                side_str, ot_str, actual_size, limit_price, stop_price
+                oco_ref,
             )
         return self._engine.submit_order(
             side_str,
@@ -647,6 +647,7 @@ class RustBroker:
             trail_amount,
             trail_percent,
             valid_until,
+            oco_ref,
         )
 
     def _submit_to_rust_engine(
@@ -661,6 +662,7 @@ class RustBroker:
         trail_amount: float | None = None,
         trail_percent: float | None = None,
         valid_until: int | None = None,
+        oco_ref: int | None = None,
     ) -> None:
         order_id = self._submit_payload_to_engine(
             symbol,
@@ -672,6 +674,7 @@ class RustBroker:
             trail_amount,
             trail_percent,
             valid_until,
+            oco_ref,
         )
         self.bind_rust_order_ref(order.ref, order_id)
 
@@ -792,7 +795,6 @@ class RustBroker:
         actual_size: float,
         price: float | None,
     ) -> None:
-        order.status = Order.Submitted
         # 回填订单创建时刻的 bar 时间戳（用于回测落库映射「委托日期」，未成交取消单同样可得）
         if getattr(order, "created_ts", None) is None:
             try:
@@ -803,15 +805,22 @@ class RustBroker:
         self._orders_by_ref[order.ref] = order
         if order.oco is not None:
             self._oco_order_count += 1
-        self._notify_order_event(owner, order)
 
+        # 父单未成交时，bracket 子单只是被登记并挂起，**尚未递交市场**，因此保持
+        # backtrader 的 Created 语义，绝不提前置为 Submitted/Accepted。否则一旦父单
+        # 成交后策略清理子单，这些从未挂出过的计划单会被误记为「已取消」（真源在
+        # 这里的 status 赋值）。只有 transmit=True 的子单负责拉扯整组，此时父单先
+        # 递交、再激活子单（见 _activate_child_orders）。
         if order.parent is not None and order.parent.status != Order.Completed:
             self._deferred_child_orders.setdefault(id(order.parent), []).append(
                 (order, is_buy, actual_size, price)
             )
-            order.status = Order.Accepted
+            order.status = Order.Created
             self._notify_order_event(owner, order)
             return
+
+        order.status = Order.Submitted
+        self._notify_order_event(owner, order)
 
         self._route_accepted_order_to_matcher(order, is_buy, actual_size, price)
         self._notify_order_event(owner, order)
@@ -836,13 +845,16 @@ class RustBroker:
             side_str = "buy" if is_buy else "sell"
             payload = self._rust_order_payload(order, side_str, actual_size, price)
             valid_until = self._valid_until_ts(order)
+            oco_ref = getattr(getattr(order, "oco", None), "ref", None)
+            if oco_ref is not None:
+                self._oco_ref_by_ref[order.ref] = int(oco_ref)
             if self._buffer_order_submissions:
                 self._trail_params_by_ref[order.ref] = self._trail_params(order)
                 self._valid_until_by_ref[order.ref] = valid_until
                 self._order_submit_buffer.append((order.ref, *payload))
             else:
                 trail_amount, trail_percent = self._trail_params(order)
-                self._submit_to_rust_engine(order, *payload, trail_amount, trail_percent, valid_until)
+                self._submit_to_rust_engine(order, *payload, trail_amount, trail_percent, valid_until, oco_ref)
             order.status = Order.Accepted
         else:
             order.status = Order.Accepted
@@ -863,9 +875,45 @@ class RustBroker:
         return buffered
 
     def _cancel_order_mirror(self, order: Order, owner: Strategy | None = None) -> bool:
-        """Cancel one Python-side order mirror and notify when an owner is available."""
+        """Cancel one Python-side order mirror and notify when an owner is available.
+
+        对齐 backtrader ``bbroker.cancel`` 的语义：**只撤销真正送进过市场的订单**。
+        backtrader 的实现是 ``self.pending.remove(order)``，若订单从未进入 pending
+        （即还停留在 ``Created``、只挂在父/子队列里），会抛 ValueError 直接
+        ``return False``——即"取消一张从未挂出的单"不会产生任何市场撤单动作。
+
+        区别在于**状态落点**：backtrader 不会把这些挂起子单暴露给外部账本，而
+        tradelearn 的 ``get_orders_history`` / ``stats.orders`` 会全量输出它们。若沿用
+        backtrader 的"保持 Created"，这些单会以非终态的 ``Created`` 悬空（仍 alive），
+        既误导又不符合"计划单已失效"的语义。因此：
+
+        - **从未递交市场（Created）** → 置 ``Expired``。语义为「计划单未成交即失效」，
+          与「已在市场挂出后撤销」的 ``Canceled`` 明确区分，避免误显示为「已取消」；
+        - **已递交市场（Submitted/Accepted/Partial）** → 置 ``Canceled``（真撤销）。
+
+        两种情况都必须把子单从父单挂起队列摘除，否则父单成交时
+        ``_activate_child_orders`` 会把它重新激活为 ``Accepted``。队列以 id(parent) 为键。
+        """
         if order.status in (Order.Completed, Order.Canceled, Order.Expired):
             return False
+
+        parent = getattr(order, "parent", None)
+        if parent is not None:
+            queued = self._deferred_child_orders.get(id(parent))
+            if queued:
+                remaining = [c for c in queued if c[0] is not order]
+                if remaining:
+                    self._deferred_child_orders[id(parent)] = remaining
+                else:
+                    self._deferred_child_orders.pop(id(parent), None)
+
+        # 从未递交市场（仍 Created）：计划单失效，而非市场撤单。
+        if order.status == Order.Created:
+            order.status = Order.Expired
+            self._pending_orders = [pending for pending in self._pending_orders if pending is not order]
+            if owner is not None:
+                self._notify_order_event(owner, order)
+            return True
         order.status = Order.Canceled
         self._pending_orders = [pending for pending in self._pending_orders if pending is not order]
         if owner is not None:
@@ -1006,10 +1054,16 @@ class RustBroker:
 
 
     def _activate_child_orders(self, owner: Strategy, parent: Order) -> None:
-        """Route deferred bracket child orders once the parent has filled."""
+        """Route deferred bracket child orders once the parent has filled.
+
+        仅激活**仍真正挂起（Created）**的子单。被策略在父单成交回调里主动清理掉的
+        子单会从 ``_deferred_child_orders`` 中移除（见 ``_cancel_order_mirror``），
+        因此这里取不到它们，也就不会再被错误地重新提交成 ``Accepted``。
+        """
         children = self._deferred_child_orders.pop(id(parent), ())
         for child, is_buy, actual_size, price in children:
-            if child.alive():
+            # 只激活仍处于「已挂起未递交」语义的子单；已终态/已撤的不再复活。
+            if child.alive() and child.status == Order.Created:
                 if self._engine is not None and hasattr(self._engine, "run_bar_loop"):
                     side_str = "buy" if is_buy else "sell"
                     payload = self._rust_order_payload(child, side_str, actual_size, price)
@@ -1127,7 +1181,7 @@ class RustBroker:
 
         for order_id, signed_size, price, comm, pnl in self._iter_rust_fills(fills):
             order = orders_by_ref_get(order_id)
-            if order is None:
+            if order is None or not order.alive():
                 continue
             filled_order_refs.add(int(order_id))
 
@@ -1138,6 +1192,7 @@ class RustBroker:
                 size=abs_size,
                 comm=comm,
                 value=abs_size * price * mult,
+                dt=self._fill_datetime(order.data),
             )
 
             data = order.data

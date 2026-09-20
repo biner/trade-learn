@@ -13,7 +13,35 @@ use crate::types::*;
 
 #[pyfunction]
 fn tradelearn_rust_version() -> &'static str {
-    "0.2.5.1"
+    env!("CARGO_PKG_VERSION")
+}
+
+pub(crate) fn pop_broker_aux_params(
+    broker: &Bound<'_, PyAny>,
+    provisional_ref: u64,
+) -> PyResult<(Option<f64>, Option<f64>, Option<i64>, Option<u64>)> {
+    let (trail_amount, trail_percent) = if broker.hasattr("pop_trail_params")? {
+        broker
+            .call_method1("pop_trail_params", (provisional_ref,))?
+            .extract()?
+    } else {
+        (None, None)
+    };
+    let valid_until = if broker.hasattr("pop_valid_until")? {
+        broker
+            .call_method1("pop_valid_until", (provisional_ref,))?
+            .extract()?
+    } else {
+        None
+    };
+    let oco_ref = if broker.hasattr("pop_oco_ref")? {
+        broker
+            .call_method1("pop_oco_ref", (provisional_ref,))?
+            .extract()?
+    } else {
+        None
+    };
+    Ok((trail_amount, trail_percent, valid_until, oco_ref))
 }
 
 #[pyfunction]
@@ -89,6 +117,7 @@ fn match_order_fill(
         trail_percent: None,
         trail_watermark: None,
         valid_until: None,
+        oco_id: None,
     };
     let bar = BarEvent {
         ts,
@@ -297,11 +326,13 @@ impl RustBacktestEngine {
             // v0.2.5.1: 撤单同步 —— strategy.next() 期间 Python broker.cancel() 将撤单 ref
             // 缓冲到 _cancel_buffer，此处回调返回后统一下发到 Rust 撮合队列（假撤单修复）。
             // 注意必须置于 continue 之前：即使回调返回 None（无新订单）也要同步撤单。
-            let cancels: Vec<u64> = broker
-                .call_method0(py, "drain_cancel_buffer")?
-                .extract(py)?;
-            for cancel_ref in cancels {
-                self.inner.remove_order(cancel_ref);
+            if broker.bind(py).hasattr("drain_cancel_buffer")? {
+                let cancels: Vec<u64> = broker
+                    .call_method0(py, "drain_cancel_buffer")?
+                    .extract(py)?;
+                for cancel_ref in cancels {
+                    self.inner.remove_order(cancel_ref);
+                }
             }
 
             if drained.is_none(py) {
@@ -316,13 +347,8 @@ impl RustBacktestEngine {
             {
                 let side = parse_order_side(&side)?;
                 let order_type = parse_order_type(&order_type)?;
-                // trail 与 valid_until 参数经 broker 旁路取出（缓冲契约保持 7 元组）。
-                let (trail_amount, trail_percent): (Option<f64>, Option<f64>) = broker
-                    .call_method1(py, "pop_trail_params", (provisional_ref,))?
-                    .extract(py)?;
-                let valid_until: Option<i64> = broker
-                    .call_method1(py, "pop_valid_until", (provisional_ref,))?
-                    .extract(py)?;
+                let (trail_amount, trail_percent, valid_until, oco_ref) =
+                    pop_broker_aux_params(&broker.bind(py), provisional_ref)?;
                 let order_id = self.inner.submit_order(
                     symbol,
                     side,
@@ -333,6 +359,7 @@ impl RustBacktestEngine {
                     trail_amount,
                     trail_percent,
                     valid_until,
+                    oco_ref,
                 );
                 bindings.push((provisional_ref, order_id));
             }
@@ -343,7 +370,7 @@ impl RustBacktestEngine {
         Ok(())
     }
 
-    #[pyo3(signature = (symbol, side, order_type, size, limit_price=None, stop_price=None, trail_amount=None, trail_percent=None, valid_until=None))]
+    #[pyo3(signature = (symbol, side, order_type, size, limit_price=None, stop_price=None, trail_amount=None, trail_percent=None, valid_until=None, oco_ref=None))]
     fn submit_order_for_symbol(
         &mut self,
         symbol: String,
@@ -355,6 +382,7 @@ impl RustBacktestEngine {
         trail_amount: Option<f64>,
         trail_percent: Option<f64>,
         valid_until: Option<i64>,
+        oco_ref: Option<u64>,
     ) -> PyResult<u64> {
         let side = parse_order_side(side)?;
         let order_type = parse_order_type(order_type)?;
@@ -368,10 +396,11 @@ impl RustBacktestEngine {
             trail_amount,
             trail_percent,
             valid_until,
+            oco_ref,
         ))
     }
 
-    #[pyo3(signature = (side, order_type, size, limit_price=None, stop_price=None, trail_amount=None, trail_percent=None, valid_until=None))]
+    #[pyo3(signature = (side, order_type, size, limit_price=None, stop_price=None, trail_amount=None, trail_percent=None, valid_until=None, oco_ref=None))]
     fn submit_order(
         &mut self,
         side: &str,
@@ -382,6 +411,7 @@ impl RustBacktestEngine {
         trail_amount: Option<f64>,
         trail_percent: Option<f64>,
         valid_until: Option<i64>,
+        oco_ref: Option<u64>,
     ) -> PyResult<u64> {
         self.submit_order_for_symbol(
             "data0".to_string(),
@@ -393,6 +423,7 @@ impl RustBacktestEngine {
             trail_amount,
             trail_percent,
             valid_until,
+            oco_ref,
         )
     }
 

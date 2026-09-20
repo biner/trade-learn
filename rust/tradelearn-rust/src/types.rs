@@ -74,6 +74,8 @@ pub struct OrderEvent {
     pub trail_watermark: Option<f64>,
     /// 订单绝对失效时间戳（UNIX秒）。若当前 bar.ts > valid_until，则自动过期不撮合。
     pub valid_until: Option<Timestamp>,
+    /// OCO 互斥订单 ID（若此单或关联单成交，对方立即作废撤销，严格杜绝超卖）。
+    pub oco_id: Option<OrderId>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

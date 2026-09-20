@@ -55,8 +55,9 @@ def _match(
 def test_rust_match_order_fill_uses_exact_bar_rules() -> None:
     assert _match("buy", "limit", limit_price=9.0) == (2.0, 9.0, 0.0, 0.0)
     assert _match("sell", "limit", limit_price=11.0) == (-2.0, 11.0, 0.0, 0.0)
-    assert _match("buy", "stop", stop_price=11.5) == (2.0, 10.0, 0.0, 0.0)
-    assert _match("sell", "stop", stop_price=8.5) == (-2.0, 10.0, 0.0, 0.0)
+    # Stop 单盘中突破/跌破成交于触发价（对齐 backtrader _try_exec_stop）
+    assert _match("buy", "stop", stop_price=11.5) == (2.0, 11.5, 0.0, 0.0)
+    assert _match("sell", "stop", stop_price=8.5) == (-2.0, 8.5, 0.0, 0.0)
     assert _match("buy", "stop_limit", limit_price=9.5, stop_price=11.5) == (
         2.0,
         9.5,
@@ -99,9 +100,9 @@ def test_exact_broker_routes_order_prices_to_rust_exact_engine() -> None:
 
     [strategy] = cerebro.run()
 
-    assert strategy.filled_prices == [10.0]
+    assert strategy.filled_prices == [11.5]
     assert strategy.position.size == 2.0
-    assert strategy.position.price == 10.0
+    assert strategy.position.price == 11.5
 
 
 def test_smart_broker_still_routes_to_rust_engine() -> None:
@@ -240,7 +241,7 @@ def test_rust_broker_can_buffer_order_submissions_for_rust_driven_callbacks() ->
 
     assert order.ref == 42
     assert broker._orders_by_ref[42] is order
-    assert engine.submissions == [("buy", "limit", 2.0, 9.5, None)]
+    assert [sub[:5] for sub in engine.submissions] == [("buy", "limit", 2.0, 9.5, None)]
 
 
 def test_rust_broker_can_drain_buffer_without_reentering_engine() -> None:
